@@ -15,7 +15,6 @@ from app.adapters.outbound.filesystem import CHUNK_SIZE, FilesystemObjectStore
 from app.domain.media import object_key_for
 from app.platform import errors
 
-
 GENEROUS = 1024 * 1024 * 1024
 
 
@@ -43,7 +42,7 @@ async def test_bytes_survive_a_round_trip(store: FilesystemObjectStore):
     key = object_key_for("abcd1234")
     data = b"hello arcadia"
 
-    checksum, size = await store.put(key, one(data), max_bytes=GENEROUS)
+    checksum, _ = await store.put(key, one(data), max_bytes=GENEROUS)
 
     assert checksum == sha256(data).hexdigest()
     assert b"".join([chunk async for chunk in store.open(key)]) == data
