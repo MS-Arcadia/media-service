@@ -1,0 +1,26 @@
+# Virtualenvs and build output
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local configuration. .env.example is committed; .env is not.
+.env
+.env.local
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+.local-store/

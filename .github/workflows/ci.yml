@@ -1,0 +1,102 @@
+# Catalog service pipeline.
+#
+# Lint, test, then build the image. The tests need no database and no broker: every
+# dependency is behind a port with an in-memory fake, which is what makes this fast
+# enough to run on every push.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: Lint
+        run: |
+          ruff check --output-format=github .
+          ruff format --check .
+
+      - name: Test
+        run: pytest -q
+
+      - name: Migrations are append-only
+        # An applied migration whose contents changed would leave two environments
+        # quietly different, so the runner refuses it at boot. This catches the edit in
+        # review instead.
+        run: |
+          if git rev-parse origin/main >/dev/null 2>&1; then
+            changed=$(git diff --name-only --diff-filter=M origin/main...HEAD -- migrations/ || true)
+            if [ -n "$changed" ]; then
+              echo "these applied migrations were edited; add a new file instead:"
+              echo "$changed"
+              exit 1
+            fi
+          fi
+          echo "no migration was edited in place"
+
+  image:
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: arcadia/media-service:${{ github.sha }}
+          build-args: VERSION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: The image starts and reports unready without a database
+        # A container that cannot reach Postgres must report DOWN rather than UP. This is
+        # the check that would have caught a readiness probe wired to nothing.
+        run: |
+          docker run -d --name media \
+            -e DATABASE_URL=postgresql://nobody:nobody@127.0.0.1:5432/nothing \
+            -e JWT_SECRET=ci-only-secret-at-least-32-characters-long \
+            -e DOWNLOAD_SECRET=ci-only-download-secret-32-characters \
+            -e STORAGE_ROOT=/tmp/arcadia-media \
+            -e KAFKA_ENABLED=false \
+            -e RUN_MIGRATIONS=false \
+            -p 8084:8084 \
+            arcadia/media-service:${{ github.sha }}
+          for i in $(seq 1 30); do
+            if curl -sf localhost:8084/livez >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf localhost:8084/livez | grep -q UP
+          echo "liveness is up"
+          status=$(curl -s -o /dev/null -w '%{http_code}' localhost:8084/readyz)
+          [ "$status" = "503" ] || { echo "expected 503 from /readyz, got $status"; docker logs media; exit 1; }
+          echo "readiness correctly reports 503 with no database"
+          docker rm -f media
