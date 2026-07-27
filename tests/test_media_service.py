@@ -163,6 +163,12 @@ class InMemoryRepository:
         _require_scope(self._uow)
         return sum(m.size_bytes for m in self.items.values() if not m.is_deleted)
 
+    async def bytes_for_owner(self, owner_id: str) -> int:
+        _require_scope(self._uow)
+        return sum(
+            m.size_bytes for m in self.items.values() if m.owner_id == owner_id and not m.is_deleted
+        )
+
 
 class RecordingPublisher:
     def __init__(self) -> None:
@@ -176,7 +182,9 @@ class RecordingPublisher:
 
 
 class Harness:
-    def __init__(self) -> None:
+    def __init__(
+        self, *, storage_soft_limit_bytes: int = 10**12, owner_quota_bytes: int = 10**12
+    ) -> None:
         self.clock = FixedClock()
         self.store = InMemoryStore()
         self.uow = FakeUnitOfWork()
@@ -193,6 +201,10 @@ class Harness:
             clock=self.clock,
             new_id=lambda: f"media-{next(counter)}",
             public_base_url="http://localhost:8084",
+            # Effectively unlimited by default, so the ordinary tests are unaffected by them.
+            # The quota tests pass small numbers instead of uploading gigabytes.
+            storage_soft_limit_bytes=storage_soft_limit_bytes,
+            owner_quota_bytes=owner_quota_bytes,
         )
 
     async def upload_png(self, **kwargs):
@@ -537,3 +549,83 @@ async def test_the_stores_size_limit_is_the_one_that_applies(h: Harness):
             chunks=one(oversized),
         )
     assert caught.value.reason == "MEDIA_TOO_LARGE"
+
+
+# --- quotas -------------------------------------------------------------
+#
+# Two separate limits, and each test names which hole it closes.
+
+
+async def test_an_owner_over_their_quota_cannot_upload():
+    """The point of the per-owner limit.
+
+    Without it, one developer uploading builds in a loop reaches the global limit on their own
+    and every other developer on the platform is unable to publish.
+    """
+    h = Harness(owner_quota_bytes=len(PNG) + 10)
+    await h.upload_png(owner_id="dev-1")
+
+    with pytest.raises(errors.AppError) as caught:
+        await h.upload_png(owner_id="dev-1")
+    assert caught.value.reason == "OWNER_QUOTA_EXCEEDED"
+    assert caught.value.details["quota_bytes"] == len(PNG) + 10
+
+
+async def test_one_owners_quota_does_not_affect_another():
+    """A quota is a fair share, so it has to be counted per owner rather than in total."""
+    h = Harness(owner_quota_bytes=len(PNG) + 10)
+    await h.upload_png(owner_id="dev-1")
+
+    view = await h.upload_png(owner_id="dev-2")
+    assert view.id
+
+
+async def test_deleting_gives_the_space_back():
+    """A developer who withdrew a build has given the space back.
+
+    Counting deleted media against them would make the quota impossible to get under, which is
+    the kind of bug that only shows up once someone actually hits the limit.
+    """
+    h = Harness(owner_quota_bytes=len(PNG) + 10)
+    first = await h.upload_png(owner_id="dev-1")
+    await h.service.delete(media_id=first.id, user_id="dev-1", is_staff=False)
+
+    view = await h.upload_png(owner_id="dev-1")
+    assert view.id
+
+
+async def test_a_rejected_upload_leaves_no_bytes_behind():
+    """The size is only known after the write, so the second check runs with the file already on
+    disk. If the cleanup did not happen, every refused upload would leak the very space the
+    quota exists to protect."""
+    h = Harness(owner_quota_bytes=len(PNG) + 10)
+    await h.upload_png(owner_id="dev-1")
+    stored_before = dict(h.store.objects)
+
+    with pytest.raises(errors.AppError):
+        await h.upload_png(owner_id="dev-1")
+    assert h.store.objects == stored_before
+
+
+async def test_the_global_soft_limit_stops_uploads_from_everyone():
+    """Reported as unavailable, not as a bad request: the uploader did nothing wrong, and once
+    an operator reclaims space the identical request succeeds."""
+    h = Harness(storage_soft_limit_bytes=len(PNG) + 10)
+    await h.upload_png(owner_id="dev-1")
+
+    with pytest.raises(errors.AppError) as caught:
+        await h.upload_png(owner_id="dev-2")
+    assert caught.value.reason == "STORAGE_SOFT_LIMIT_REACHED"
+    assert caught.value.code is errors.Code.UNAVAILABLE
+
+
+async def test_an_owner_already_over_quota_is_refused_before_the_bytes_are_read():
+    """An upload that cannot be kept should not spend twenty minutes of bandwidth first.
+
+    Proven by the store never being written to, not by timing.
+    """
+    h = Harness(owner_quota_bytes=1)
+    with pytest.raises(errors.AppError) as caught:
+        await h.upload_png(owner_id="dev-1")
+    assert caught.value.reason == "OWNER_QUOTA_EXCEEDED"
+    assert h.store.objects == {}

@@ -86,6 +86,8 @@ def build(config: Config | None = None) -> FastAPI:
         clock=SystemClock(),
         new_id=new_id,
         public_base_url=cfg.public_base_url,
+        storage_soft_limit_bytes=cfg.storage_soft_limit_bytes,
+        owner_quota_bytes=cfg.owner_quota_bytes,
     )
 
     producer = kafka.Producer(cfg.kafka_brokers, cfg.service_name) if cfg.kafka_enabled else None

@@ -30,6 +30,14 @@ class Config(BaseConfig):
     # the point where Postgres on the same host cannot write either.
     storage_soft_limit_bytes: int = 20 * 1024 * 1024 * 1024
 
+    # And a limit per owner, because the global one alone does not protect anybody: one
+    # developer uploading builds in a loop reaches it on their own, and every other developer
+    # on the platform is then unable to publish. A fair share is the point, not a total.
+    #
+    # 5 GiB is roughly two large game builds plus their screenshots. Generous for a real
+    # developer, and the wrong order of magnitude for a script.
+    owner_quota_bytes: int = 5 * 1024 * 1024 * 1024
+
     topic_media_events: str = "media-events"
 
     # CsvList, not list[str]: redeclaring the field here would otherwise discard the

@@ -92,12 +92,21 @@ def auth(**kwargs) -> dict[str, str]:
     return {"Authorization": f"Bearer {token(**kwargs)}"}
 
 
-def upload(client, data: bytes, *, kind: str, content_type: str, name: str = "f.bin", **form):
+def upload(
+    client,
+    data: bytes,
+    *,
+    kind: str,
+    content_type: str,
+    name: str = "f.bin",
+    headers: dict[str, str] | None = None,
+    **form,
+):
     return client.post(
         "/v1/media",
         files={"file": (name, data, content_type)},
         data={"kind": kind, **form},
-        headers=auth(),
+        headers=headers or auth(),
     )
 
 
@@ -307,3 +316,39 @@ def test_readiness_reports_the_storage_check(client):
     assert body["status"] == "DOWN"
     assert body["checks"]["storage"]["status"] == "UP"
     assert body["checks"]["postgres"]["status"] == "DOWN"
+
+
+def test_usage_reports_the_callers_quota(client):
+    """Also a guard on route ordering.
+
+    `/v1/media/usage` and `/v1/media/{media_id}` both match this path, and FastAPI takes the
+    first declared. If somebody moves the usage route below the other one, this returns a 404
+    for media id "usage" instead — a failure with no obvious cause in the diff that caused it.
+    """
+    response = client.get("/v1/media/usage", headers=auth())
+    assert response.status_code == 200, response.text
+
+    body = response.json()
+    assert body["quota_bytes"] > 0
+    assert body["used_bytes"] + body["remaining_bytes"] == body["quota_bytes"]
+
+
+def test_usage_counts_only_the_callers_own_files(client):
+    upload(
+        client,
+        PNG,
+        kind="IMAGE",
+        content_type="image/png",
+        headers=auth(user_id="dev-quota-a"),
+    )
+
+    mine = client.get("/v1/media/usage", headers=auth(user_id="dev-quota-a")).json()
+    theirs = client.get("/v1/media/usage", headers=auth(user_id="dev-quota-b")).json()
+
+    assert mine["used_bytes"] > 0
+    assert theirs["used_bytes"] == 0
+
+
+def test_usage_requires_authentication(client):
+    """There is no such thing as an anonymous quota."""
+    assert client.get("/v1/media/usage").status_code == 401

@@ -121,6 +121,20 @@ class PostgresMediaRepository:
             or 0
         )
 
+    async def bytes_for_owner(self, owner_id: str) -> int:
+        session = current_session()
+        return int(
+            (
+                await session.execute(
+                    select(func.coalesce(func.sum(MediaRow.size_bytes), 0)).where(
+                        MediaRow.owner_id == owner_id,
+                        MediaRow.deleted_at.is_(None),
+                    )
+                )
+            ).scalar()
+            or 0
+        )
+
     async def _page(
         self, stmt: Select, *, limit: int, offset: int
     ) -> tuple[list[MediaObject], int]:

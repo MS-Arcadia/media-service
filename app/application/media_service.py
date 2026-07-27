@@ -16,7 +16,7 @@ from collections.abc import AsyncIterator
 
 from app.application import events as ev
 from app.application.download_token import TokenIssuer
-from app.application.dto import DownloadTicket, MediaView, Page
+from app.application.dto import DownloadTicket, MediaView, Page, QuotaView
 from app.application.ports import (
     Clock,
     EventPublisher,
@@ -51,6 +51,8 @@ class MediaService:
         clock: Clock,
         new_id: IdFactory,
         public_base_url: str,
+        storage_soft_limit_bytes: int,
+        owner_quota_bytes: int,
     ) -> None:
         self._uow = uow
         self._repo = repository
@@ -60,6 +62,8 @@ class MediaService:
         self._clock = clock
         self._new_id = new_id
         self._public_base_url = public_base_url.rstrip("/")
+        self._storage_soft_limit = storage_soft_limit_bytes
+        self._owner_quota = owner_quota_bytes
 
     # --- upload ----------------------------------------------------------
 
@@ -85,6 +89,10 @@ class MediaService:
         if not head:
             raise errors.invalid_argument("the uploaded file is empty", reason="MEDIA_EMPTY")
 
+        # Refused before the first write where possible: an upload that cannot be kept should
+        # not spend twenty minutes of bandwidth first.
+        await self._check_quota(owner_id)
+
         # Identified from the bytes, not from what the uploader said they are. Done before the
         # first write, so an HTML page announced as a PNG never reaches the disk at all.
         sniffed = content.identify(head[: content.SNIFF_BYTES], declared_type)
@@ -100,6 +108,13 @@ class MediaService:
         checksum, size = await self._store.put(object_key, body, max_bytes=MAX_SIZE[kind])
 
         try:
+            # Checked a second time, now that the size is actually known. The pre-flight check
+            # could only refuse an owner who was *already* over; this is what stops a single
+            # 4 GB build from taking someone from just-under to far-over. The bytes are on disk
+            # at this point, so the `except` below removes them — which is exactly the cleanup
+            # path a failed metadata write already uses.
+            await self._check_quota(owner_id, incoming=size)
+
             media = MediaObject.create(
                 media_id=media_id,
                 owner_id=owner_id,
@@ -140,6 +155,63 @@ class MediaService:
             },
         )
         return self._view(media)
+
+    async def quota(self, *, owner_id: str) -> QuotaView:
+        """How much of their share this owner has used."""
+        async with self._uow.read():
+            used = await self._repo.bytes_for_owner(owner_id)
+        return QuotaView(
+            used_bytes=used,
+            quota_bytes=self._owner_quota,
+            # Floored at zero. A negative remainder is arithmetically true — the advisory check
+            # allows a concurrent pair of uploads to overshoot — but "-2 bytes left" is not a
+            # thing a client can render or reason about.
+            remaining_bytes=max(0, self._owner_quota - used),
+        )
+
+    async def _check_quota(self, owner_id: str, *, incoming: int = 0) -> None:
+        """Refuse an upload that would exceed the global soft limit or this owner's share.
+
+        Two limits, because either alone leaves a hole. Without the global one the disk fills
+        when enough owners each stay under their share. Without the per-owner one a single
+        developer uploading in a loop reaches the global limit alone and nobody else on the
+        platform can publish.
+
+        Deliberately advisory rather than transactional. Two concurrent uploads can both read a
+        usage figure from before the other and both be allowed, so the true ceiling is the quota
+        plus one file. Making it exact would mean serialising every upload on a lock held for the
+        length of a 4 GB transfer, which trades a small overshoot for a service that cannot
+        upload two files at once. The per-file `MAX_SIZE` cap bounds the overshoot.
+        """
+        async with self._uow.read():
+            total = await self._repo.total_bytes()
+            owned = await self._repo.bytes_for_owner(owner_id)
+
+        if total + incoming > self._storage_soft_limit:
+            # 503, not 400: the uploader did nothing wrong, and once an operator has reclaimed
+            # space the identical request succeeds. Logged at error for the same reason — this
+            # needs an operator, not a support agent.
+            logger.error(
+                "refusing an upload: the object store is at its soft limit",
+                extra={
+                    "stored_bytes": total,
+                    "incoming_bytes": incoming,
+                    "limit_bytes": self._storage_soft_limit,
+                },
+            )
+            raise errors.unavailable(
+                "the platform is temporarily unable to accept uploads",
+                reason="STORAGE_SOFT_LIMIT_REACHED",
+            )
+
+        if owned + incoming > self._owner_quota:
+            raise errors.failed_precondition(
+                f"this account is storing {owned} bytes of its {self._owner_quota}-byte quota; "
+                f"delete something before uploading {incoming or 'more'}",
+                reason="OWNER_QUOTA_EXCEEDED",
+                used_bytes=owned,
+                quota_bytes=self._owner_quota,
+            )
 
     # --- read ------------------------------------------------------------
     #

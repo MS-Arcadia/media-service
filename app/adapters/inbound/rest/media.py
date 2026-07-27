@@ -20,7 +20,7 @@ from app.adapters.inbound.rest.deps import (
     OptionalCallerDep,
     PageDep,
 )
-from app.application.dto import DownloadTicket, MediaView, Page
+from app.application.dto import DownloadTicket, MediaView, Page, QuotaView
 from app.domain.media import MAX_SIZE, MediaKind, Visibility
 from app.platform import errors
 
@@ -95,6 +95,17 @@ async def list_mine(
         kind=kind,
         include_deleted=include_deleted,
     )
+
+
+@router.get("/usage", response_model=QuotaView)
+async def usage(service: MediaServiceDep, caller: CallerDep) -> QuotaView:
+    """How much of their storage quota the caller has used.
+
+    Registered **above** ``/{media_id}`` deliberately: FastAPI matches routes in declaration
+    order, so with the paths the other way round "usage" would be read as a media id and this
+    endpoint would be unreachable.
+    """
+    return await service.quota(owner_id=caller.user_id)
 
 
 @router.get("/by-reference/{reference_id}", response_model=list[MediaView])

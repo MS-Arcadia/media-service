@@ -47,3 +47,15 @@ class DownloadTicket(BaseModel):
 class StorageStatsView(BaseModel):
     total_bytes: int
     object_count: int
+
+
+class QuotaView(BaseModel):
+    """What one owner has left.
+
+    Exposed because a quota nobody can see is one they discover by having an upload refused
+    after the bytes have already gone over the wire.
+    """
+
+    used_bytes: int
+    quota_bytes: int
+    remaining_bytes: int

@@ -85,6 +85,14 @@ class MediaRepository(Protocol):
 
     async def total_bytes(self) -> int: ...
 
+    async def bytes_for_owner(self, owner_id: str) -> int:
+        """What this owner is currently storing, excluding what they have deleted.
+
+        Deleted media does not count: a developer who withdrew a build has given the space
+        back, and charging them for it would make the quota impossible to get under.
+        """
+        ...
+
 
 class EventPublisher(Protocol):
     async def enqueue(
