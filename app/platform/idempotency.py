@@ -53,6 +53,39 @@ class Store:
     def __init__(self, *, in_flight_grace: timedelta = timedelta(seconds=30)) -> None:
         self._grace = in_flight_grace
 
+    async def lookup(self, session: AsyncSession, *, key: str, request: Any) -> dict | None:
+        """Return the stored response for ``key``, without claiming it.
+
+        A read-only pre-check, for use *before* a use case does expensive work that a replay
+        would make pointless — a call to another service, say.
+
+        It is not a substitute for ``claim``: two concurrent first attempts would both find
+        nothing here and both proceed. ``claim`` is still what makes the work happen once. This
+        only short-circuits the common case, where the client is retrying something that has
+        already finished.
+
+        A body that disagrees with the stored one is rejected here too, so a client bug is
+        reported before anything else is attempted rather than after.
+        """
+        if not key:
+            raise errors.invalid_argument(
+                "an Idempotency-Key header is required for this request",
+                reason="IDEMPOTENCY_KEY_REQUIRED",
+            )
+        existing = (
+            await session.execute(select(IdempotencyKey).where(IdempotencyKey.key == key))
+        ).scalar_one_or_none()
+        if existing is None or existing.completed_at is None:
+            return None
+        if existing.request_hash != hash_request(request):
+            raise errors.conflict(
+                "this Idempotency-Key was already used with a different request body",
+                reason="IDEMPOTENCY_KEY_REUSED",
+            )
+        stored = dict(existing.response or {})
+        stored["idempotent_replay"] = True
+        return stored
+
     async def claim(
         self, session: AsyncSession, *, key: str, scope: str, request: Any
     ) -> dict | None:

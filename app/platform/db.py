@@ -125,6 +125,33 @@ class UnitOfWork:
             finally:
                 session_var.reset(token)
 
+    @asynccontextmanager
+    async def read(self) -> AsyncIterator[AsyncSession]:
+        """Yield a session for reads, with no write transaction.
+
+        Queries need a session as much as commands do — the repositories take it from
+        ``current_session`` either way — but they must not open a read-write transaction. One
+        held open across a slow query keeps a connection and blocks vacuum for no reason, and
+        a use case that only reads should not be able to commit by accident.
+
+        Nesting inside ``begin()`` reuses the outer session, so a command that reads before it
+        writes sees its own uncommitted work.
+        """
+        existing = session_var.get()
+        if existing is not None:
+            yield existing
+            return
+
+        async with self._sessions() as session:
+            token = session_var.set(session)
+            try:
+                yield session
+            finally:
+                session_var.reset(token)
+                # Any implicit transaction SQLAlchemy opened for the SELECTs is discarded
+                # rather than committed. Nothing here was supposed to write.
+                await session.rollback()
+
 
 def strip_asyncpg_dsn(dsn: str) -> str:
     """Return a DSN for asyncpg's own connect(), which rejects SQLAlchemy's prefix.

@@ -6,7 +6,7 @@ from functools import lru_cache
 
 from pydantic import Field, model_validator
 
-from app.platform.config import BaseConfig
+from app.platform.config import BaseConfig, CsvList
 
 
 class Config(BaseConfig):
@@ -32,7 +32,10 @@ class Config(BaseConfig):
 
     topic_media_events: str = "media-events"
 
-    cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+    # CsvList, not list[str]: redeclaring the field here would otherwise discard the
+    # NoDecode annotation it carries in BaseConfig, and CORS_ORIGINS=a,b would fail to
+    # parse at boot.
+    cors_origins: CsvList = Field(default_factory=lambda: ["http://localhost:3000"])
 
     @property
     def owned_topics(self) -> list[str]:

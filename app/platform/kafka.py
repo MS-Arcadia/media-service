@@ -114,7 +114,22 @@ class Consumer:
     ) -> None:
         self._brokers = brokers
         self._topic = topic
-        self._group_id = group_id
+        # The group is scoped to the topic, and that is not cosmetic.
+        #
+        # A Kafka consumer group has ONE subscription shared by all its members. Two consumers
+        # in the same group subscribing to different topics is a misconfiguration: the
+        # coordinator assigns partitions from the *union* of the subscriptions, so a partition
+        # of topic A can be handed to the member that only subscribed to topic B — which
+        # ignores it. Nothing errors. The messages are simply never processed.
+        #
+        # This service hit exactly that: one group with a consumer on wallet-events and another
+        # on game-events. game-events committed normally, wallet-events never committed a
+        # single offset, and every purchase sat in PENDING with no error in any log.
+        #
+        # Deriving the group from the topic makes the two cases come out right on their own:
+        # different topics get different groups, and two consumers on the *same* topic still
+        # share one group and split its partitions, which is what scaling out should do.
+        self._group_id = f"{group_id}.{topic}"
         self._router = router
         self._producer = producer
         self._dlq_topic = f"{topic}{dlq_suffix}"

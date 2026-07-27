@@ -43,14 +43,48 @@ class FixedClock:
 
 
 class FakeUnitOfWork:
+    """A transaction that does nothing — but insists on existing.
+
+    The requirement that a scope is open is the point: the real repository takes its session
+    from a context variable, so a use case that reads without opening one passes every unit
+    test and then returns 500 in production. That happened, and it reached a container.
+    """
+
     def __init__(self) -> None:
         self.fail_on_commit = False
+        self.depth = 0
+
+    @property
+    def active(self) -> bool:
+        return self.depth > 0
 
     @asynccontextmanager
     async def begin(self):
-        yield None
-        if self.fail_on_commit:
-            raise RuntimeError("the database went away at commit time")
+        self.depth += 1
+        try:
+            yield None
+            if self.fail_on_commit:
+                raise RuntimeError("the database went away at commit time")
+        finally:
+            self.depth -= 1
+
+    @asynccontextmanager
+    async def read(self):
+        """A read scope. Nested inside begin(), it reuses it, like the real one."""
+        self.depth += 1
+        try:
+            yield None
+        finally:
+            self.depth -= 1
+
+
+def _require_scope(uow) -> None:
+    """Mirror what platform.db.current_session does to a repository called out of scope."""
+    if uow is not None and not uow.active:
+        raise errors.internal(
+            "no database session is active; repository calls must happen inside "
+            "uow.begin() or uow.read()"
+        )
 
 
 class InMemoryStore:
@@ -90,24 +124,30 @@ class InMemoryStore:
 
 
 class InMemoryRepository:
-    def __init__(self) -> None:
+    def __init__(self, uow=None) -> None:
         self.items: dict[str, MediaObject] = {}
+        self._uow = uow
 
     async def add(self, media: MediaObject) -> None:
+        _require_scope(self._uow)
         self.items[media.id] = media
 
     async def get(self, media_id: str) -> MediaObject | None:
+        _require_scope(self._uow)
         return self.items.get(media_id)
 
     async def get_for_update(self, media_id: str) -> MediaObject | None:
+        _require_scope(self._uow)
         return self.items.get(media_id)
 
     async def save(self, media: MediaObject) -> None:
+        _require_scope(self._uow)
         self.items[media.id] = media
 
     async def list_for_owner(
         self, owner_id: str, *, limit: int, offset: int, kind=None, include_deleted: bool = False
     ):
+        _require_scope(self._uow)
         items = [m for m in self.items.values() if m.owner_id == owner_id]
         if kind is not None:
             items = [m for m in items if m.kind is kind]
@@ -116,9 +156,11 @@ class InMemoryRepository:
         return items[offset : offset + limit], len(items)
 
     async def list_for_reference(self, reference_id: str):
+        _require_scope(self._uow)
         return [m for m in self.items.values() if m.reference_id == reference_id]
 
     async def total_bytes(self) -> int:
+        _require_scope(self._uow)
         return sum(m.size_bytes for m in self.items.values() if not m.is_deleted)
 
 
@@ -137,9 +179,10 @@ class Harness:
     def __init__(self) -> None:
         self.clock = FixedClock()
         self.store = InMemoryStore()
-        self.repo = InMemoryRepository()
-        self.publisher = RecordingPublisher()
         self.uow = FakeUnitOfWork()
+        # Given the unit of work so it refuses a call made outside a scope, as the real one does.
+        self.repo = InMemoryRepository(self.uow)
+        self.publisher = RecordingPublisher()
         counter = count(1)
         self.service = MediaService(
             uow=self.uow,

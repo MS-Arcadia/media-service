@@ -142,11 +142,15 @@ class MediaService:
         return self._view(media)
 
     # --- read ------------------------------------------------------------
+    #
+    # Reads open `uow.read()`, not `uow.begin()`: they need a session, because the repository
+    # takes it from `current_session`, but not a read-write transaction.
 
     async def describe(
         self, *, media_id: str, user_id: str, is_staff: bool, has_read_scope: bool
     ) -> MediaView:
-        media = await self._require(media_id)
+        async with self._uow.read():
+            media = await self._require(media_id)
         if not media.readable_by(user_id=user_id, is_staff=is_staff, has_read_scope=has_read_scope):
             # Not found rather than forbidden. "Forbidden" confirms the id is real, which
             # tells somebody enumerating ids that they have found an unreleased build.
@@ -161,7 +165,8 @@ class MediaService:
         Authorisation happens **here**, once, rather than on every byte of a download that
         may take twenty minutes. The token is the proof that it happened.
         """
-        media = await self._require(media_id)
+        async with self._uow.read():
+            media = await self._require(media_id)
         if not media.readable_by(user_id=user_id, is_staff=is_staff, has_read_scope=has_read_scope):
             raise errors.not_found(f"media {media_id} was not found")
 
@@ -192,7 +197,8 @@ class MediaService:
         public object needs no token at all — that is what public means, and requiring one
         for a storefront screenshot would mean two round trips per image.
         """
-        media = await self._require(media_id)
+        async with self._uow.read():
+            media = await self._require(media_id)
 
         if not media.is_public:
             if token:
@@ -222,9 +228,10 @@ class MediaService:
         kind: MediaKind | None = None,
         include_deleted: bool = False,
     ) -> Page[MediaView]:
-        items, total = await self._repo.list_for_owner(
-            owner_id, limit=limit, offset=offset, kind=kind, include_deleted=include_deleted
-        )
+        async with self._uow.read():
+            items, total = await self._repo.list_for_owner(
+                owner_id, limit=limit, offset=offset, kind=kind, include_deleted=include_deleted
+            )
         return Page(items=[self._view(m) for m in items], total=total, limit=limit, offset=offset)
 
     async def list_for_reference(self, *, reference_id: str) -> list[MediaView]:
@@ -233,7 +240,8 @@ class MediaService:
         Only the public objects, whoever asks. This is how a storefront page fetches a
         game's screenshots, and it must not leak the build sitting behind them.
         """
-        items = await self._repo.list_for_reference(reference_id)
+        async with self._uow.read():
+            items = await self._repo.list_for_reference(reference_id)
         return [self._view(m) for m in items if m.is_public and not m.is_deleted]
 
     # --- delete ----------------------------------------------------------

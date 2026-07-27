@@ -79,6 +79,8 @@ def token(*, role: str = "DEVELOPER", user_id: str = "dev-1", scopes: list[str] 
             "role": role,
             "typ": "access",
             "scopes": scopes or [],
+            "iss": "arcadia-auth",
+            "aud": "arcadia",
             "exp": datetime.now(UTC) + timedelta(minutes=5),
         },
         SECRET,
