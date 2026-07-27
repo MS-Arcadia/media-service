@@ -25,7 +25,14 @@ from app.application.ports import (
     ObjectStore,
 )
 from app.domain import content
-from app.domain.media import MediaKind, MediaObject, Visibility, validate_size
+from app.domain.media import (
+    MAX_SIZE,
+    MediaKind,
+    MediaObject,
+    Visibility,
+    object_key_for,
+    validate_content,
+)
 from app.platform import errors
 from app.platform.db import UnitOfWork
 
@@ -62,40 +69,50 @@ class MediaService:
         owner_id: str,
         kind: MediaKind,
         declared_type: str,
-        data: bytes,
+        chunks: AsyncIterator[bytes],
         filename: str = "",
         reference_id: str = "",
         visibility: Visibility | None = None,
     ) -> MediaView:
-        """Store a file.
+        """Store a file from a stream.
 
-        The size is checked before anything else, and again by the request-body limit at the
-        edge — two layers, because the cheapest place to reject a 5 GB upload is before it
-        has been read into memory, and this layer cannot be the only one that tries.
+        The order matters. The **type** is decided from the first chunk and validated before
+        anything is written, so a rejected upload costs one buffer rather than a whole file on
+        disk. The **size** is then enforced by the store as the chunks pass through, because it
+        is not knowable in advance from anything trustworthy.
         """
-        validate_size(kind=kind, size_bytes=len(data))
+        head, body = await _peek(chunks)
+        if not head:
+            raise errors.invalid_argument("the uploaded file is empty", reason="MEDIA_EMPTY")
 
-        # Identified from the bytes, not from what the uploader said they are.
-        sniffed = content.identify(data[: content.SNIFF_BYTES], declared_type)
-
-        media = MediaObject.create(
-            media_id=self._new_id(),
-            owner_id=owner_id,
-            kind=kind,
-            declared_type=declared_type,
-            sniffed_type=sniffed,
-            size_bytes=len(data),
-            filename=filename,
-            reference_id=reference_id,
-            visibility=visibility,
-            now=self._clock.now(),
+        # Identified from the bytes, not from what the uploader said they are. Done before the
+        # first write, so an HTML page announced as a PNG never reaches the disk at all.
+        sniffed = content.identify(head[: content.SNIFF_BYTES], declared_type)
+        content_type = validate_content(
+            kind=kind, declared_type=declared_type, sniffed_type=sniffed
         )
 
-        # Bytes first. See the module docstring: an orphaned file is recoverable, a metadata
-        # row pointing at nothing is not.
-        media.checksum = await self._store.put(media.object_key, data)
+        media_id = self._new_id()
+        object_key = object_key_for(media_id)
+
+        # Bytes first. See the module docstring: an orphaned file is recoverable, a metadata row
+        # pointing at nothing is not.
+        checksum, size = await self._store.put(object_key, body, max_bytes=MAX_SIZE[kind])
 
         try:
+            media = MediaObject.create(
+                media_id=media_id,
+                owner_id=owner_id,
+                kind=kind,
+                declared_type=declared_type,
+                sniffed_type=sniffed,
+                size_bytes=size,
+                filename=filename,
+                checksum=checksum,
+                reference_id=reference_id,
+                visibility=visibility,
+                now=self._clock.now(),
+            )
             async with self._uow.begin() as session:
                 await self._repo.add(media)
                 await self._publisher.enqueue(
@@ -106,10 +123,10 @@ class MediaService:
                     payload=_payload(media),
                 )
         except Exception:
-            # The row did not land, so nothing references these bytes. Removing them here
-            # turns the common failure into no leak at all; a crash before this line still
-            # leaves an orphan for a sweep to find, which is the accepted cost.
-            await self._store.delete(media.object_key)
+            # Nothing references these bytes, so removing them turns the common failure into no
+            # leak at all. A crash before this line still leaves an orphan for the boot-time
+            # sweep, which is the accepted cost of writing bytes first.
+            await self._store.delete(object_key)
             raise
 
         logger.info(
@@ -118,7 +135,7 @@ class MediaService:
                 "media_id": media.id,
                 "kind": str(media.kind),
                 "size_bytes": media.size_bytes,
-                "content_type": media.content_type,
+                "content_type": content_type,
                 "visibility": str(media.visibility),
             },
         )
@@ -305,3 +322,25 @@ def _payload(media: MediaObject) -> dict:
         "checksum": media.checksum,
         "uploaded_at": media.uploaded_at.isoformat() if media.uploaded_at else None,
     }
+
+
+async def _peek(chunks: AsyncIterator[bytes]) -> tuple[bytes, AsyncIterator[bytes]]:
+    """Take the first chunk, and return a stream that still yields it.
+
+    Needed because the file's type has to be decided before any of it is written, and the
+    first chunk is the only part that says what the file is. Putting it back rather than
+    holding the whole upload is what keeps memory flat regardless of file size.
+    """
+    head = b""
+    async for chunk in chunks:
+        if chunk:
+            head = chunk
+            break
+
+    async def replayed() -> AsyncIterator[bytes]:
+        if head:
+            yield head
+        async for chunk in chunks:
+            yield chunk
+
+    return head, replayed()

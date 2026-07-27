@@ -8,6 +8,7 @@ into an `<img src>`, a `<video>`, or a download manager, none of which will atta
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Annotated
 
 from fastapi import APIRouter, File, Form, Query, Request, UploadFile, status
@@ -29,6 +30,10 @@ router = APIRouter(prefix="/v1/media", tags=["media"])
 # outer bound, and it exists so that a request far beyond any limit is rejected without being
 # read into memory first.
 ABSOLUTE_MAX_BYTES = max(MAX_SIZE.values())
+
+# How much of an upload is read at a time. Independent of the store's write size: this is only
+# how large a buffer the edge holds, and 1 MiB keeps memory flat whatever the file size.
+READ_CHUNK_SIZE = 1024 * 1024
 
 
 @router.post("", response_model=MediaView, status_code=status.HTTP_201_CREATED)
@@ -52,16 +57,27 @@ async def upload(
     """
     _reject_oversized(request)
 
-    data = await file.read()
     return await service.upload(
         owner_id=caller.user_id,
         kind=kind,
         declared_type=file.content_type or "",
-        data=data,
+        # Streamed, not read. `await file.read()` would hold a 4 GB build in memory — once per
+        # concurrent upload — and take the container down long before anything reached disk.
+        chunks=_stream(file),
         filename=file.filename or "",
         reference_id=reference_id,
         visibility=visibility,
     )
+
+
+async def _stream(file: UploadFile) -> AsyncIterator[bytes]:
+    """Yield the upload in chunks.
+
+    Starlette has already spooled the body to a temporary file on disk if it was large, so this
+    reads it back out rather than holding it.
+    """
+    while chunk := await file.read(READ_CHUNK_SIZE):
+        yield chunk
 
 
 @router.get("", response_model=Page[MediaView])

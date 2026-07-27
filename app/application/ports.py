@@ -26,8 +26,18 @@ class IdFactory(Protocol):
 class ObjectStore(Protocol):
     """Where the bytes live."""
 
-    async def put(self, key: str, data: bytes) -> str:
-        """Store the bytes and return their checksum."""
+    async def put(
+        self, key: str, chunks: AsyncIterator[bytes], *, max_bytes: int
+    ) -> tuple[str, int]:
+        """Store a stream of chunks. Returns (checksum, size).
+
+        Takes an iterator rather than ``bytes`` on purpose. A 4 GB game build read into memory
+        first would exhaust a small container before a single byte reached disk — and would do
+        it once per concurrent upload. Nothing in this service ever holds a whole file.
+
+        ``max_bytes`` is enforced **while writing**, not after. A client that lies about
+        Content-Length would otherwise get the whole file onto disk before being told no.
+        """
         ...
 
     def open(self, key: str) -> AsyncIterator[bytes]:

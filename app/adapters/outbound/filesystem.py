@@ -13,9 +13,9 @@ It is also cheap to fix. Everything above this file talks to ``ObjectStore``, so
 MinIO adapter is a new file next to this one and one line in ``bootstrap.py``. Nothing in the
 domain or the use cases changes.
 
-Writes go to a temporary file and are then renamed. ``os.replace`` is atomic within a
+Writes stream to a temporary file and are then renamed. ``os.replace`` is atomic within a
 filesystem, so a crash mid-write leaves a temporary file to clean up rather than a
-half-written object that reads as valid.
+half-written object that reads as valid. Nothing here ever holds a whole file in memory.
 """
 
 from __future__ import annotations
@@ -62,37 +62,63 @@ class FilesystemObjectStore:
 
     # --- operations ------------------------------------------------------
 
-    async def put(self, key: str, data: bytes) -> str:
-        """Write the bytes atomically and return their SHA-256.
+    async def put(
+        self, key: str, chunks: AsyncIterator[bytes], *, max_bytes: int
+    ) -> tuple[str, int]:
+        """Write a stream atomically. Returns (sha256, size).
 
-        Runs in a worker thread. Blocking file I/O on the event loop stalls every other
-        request in the process for the duration of the write, which for a 4 GB upload means
-        stalling the whole service.
+        The whole file never exists in memory: chunks go straight to a temporary file, and the
+        checksum and size are accumulated as they pass through.
+
+        Every blocking call runs in a worker thread. Doing this on the event loop would stall
+        every other request in the process for the duration of the upload.
         """
-        return await asyncio.to_thread(self._put_sync, key, data)
-
-    def _put_sync(self, key: str, data: bytes) -> str:
         target = self._path(key)
-        target.parent.mkdir(parents=True, exist_ok=True)
-
-        # Named for the key so a leftover temporary file can be traced back to what it was
-        # meant to become.
         temp = self._tmp / f"{key.replace('/', '_')}.part"
-        temp.parent.mkdir(parents=True, exist_ok=True)
 
-        digest = sha256(data).hexdigest()
+        await asyncio.to_thread(target.parent.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(temp.parent.mkdir, parents=True, exist_ok=True)
+
+        digest = sha256()
+        size = 0
+        handle = await asyncio.to_thread(temp.open, "wb")
         try:
-            with temp.open("wb") as handle:
-                handle.write(data)
-                # Forced to disk before the rename. Without it a power loss can leave the
-                # rename durable and the contents not, which is a file that exists and is
-                # empty.
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp, target)
+            async for chunk in chunks:
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > max_bytes:
+                    # Refused mid-stream. Waiting until the end would mean writing the whole
+                    # oversized file to disk before rejecting it, which is exactly the
+                    # resource exhaustion the limit exists to prevent.
+                    raise errors.invalid_argument(
+                        f"the upload exceeds the {max_bytes // (1024 * 1024)} MB limit for this "
+                        f"kind of file",
+                        reason="MEDIA_TOO_LARGE",
+                        limit_bytes=max_bytes,
+                    )
+                digest.update(chunk)
+                await asyncio.to_thread(handle.write, chunk)
+
+            await asyncio.to_thread(handle.flush)
+            # Forced to disk before the rename. Without it a power loss can leave the rename
+            # durable and the contents not, which is a file that exists and is empty.
+            await asyncio.to_thread(os.fsync, handle.fileno())
+            await asyncio.to_thread(handle.close)
+            handle = None  # type: ignore[assignment]
+
+            if size == 0:
+                raise errors.invalid_argument("the uploaded file is empty", reason="MEDIA_EMPTY")
+
+            # Atomic within a filesystem, so a crash mid-write leaves a temporary file to
+            # clean up rather than a half-written object that reads as valid.
+            await asyncio.to_thread(os.replace, temp, target)
         finally:
-            temp.unlink(missing_ok=True)
-        return digest
+            if handle is not None:
+                await asyncio.to_thread(handle.close)
+            await asyncio.to_thread(temp.unlink, True)
+
+        return digest.hexdigest(), size
 
     def open(self, key: str) -> AsyncIterator[bytes]:
         """Open a stream over the object.

@@ -133,10 +133,22 @@ It is also cheap to change. Everything above
 `ObjectStore` protocol, so an S3 or MinIO adapter is a new file beside it and one line in
 `bootstrap.py`. Nothing in the domain or the use cases moves.
 
-Within that choice, the adapter behaves properly: writes go to a temporary file and are
-`fsync`ed before an atomic `os.replace`, all file I/O runs in a worker thread so a 4 GB
-upload does not stall the event loop, and downloads stream in 1 MiB chunks rather than
-reading a build into memory.
+Within that choice, the adapter behaves properly: writes stream to a temporary file and are
+`fsync`ed before an atomic `os.replace`, and every blocking call runs in a worker thread so an
+upload does not stall the event loop.
+
+### Nothing ever holds a whole file
+
+Uploads and downloads both stream in 1 MiB chunks. A 4 GB build read into memory would take a
+128 MB container down long before a byte reached disk — and would do it once per concurrent
+request.
+
+That constrains the order of the checks. The **type** is decided from the first chunk and
+validated before anything is written, so a rejected upload costs one buffer rather than a whole
+file on disk. The **size** cannot be known in advance from anything trustworthy — `Content-Length`
+is client-supplied — so the store enforces it *while writing* and aborts mid-stream. Waiting
+until the end would mean putting the whole oversized file on disk before rejecting it, which is
+exactly the resource exhaustion the limit exists to prevent.
 
 ---
 

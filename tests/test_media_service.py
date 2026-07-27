@@ -25,6 +25,11 @@ ZIP = b"PK\x03\x04" + b"\x00" * 100
 HTML = b"<!DOCTYPE html><script>alert(1)</script>"
 
 
+async def one(data: bytes) -> AsyncIterator[bytes]:
+    """A single-chunk stream, for tests that do not care about chunking."""
+    yield data
+
+
 class FixedClock:
     def __init__(self) -> None:
         self._now = datetime(2026, 7, 27, 12, 0, tzinfo=UTC)
@@ -53,11 +58,18 @@ class InMemoryStore:
         self.objects: dict[str, bytes] = {}
         self.fail_on_put = False
 
-    async def put(self, key: str, data: bytes) -> str:
+    async def put(self, key: str, chunks, *, max_bytes: int) -> tuple[str, int]:
         if self.fail_on_put:
             raise RuntimeError("the disk is full")
+        data = b"".join([chunk async for chunk in chunks])
+        # Mirrors the real store's mid-stream enforcement, so a test that would have exceeded
+        # the limit fails here too rather than only in production.
+        if len(data) > max_bytes:
+            raise errors.invalid_argument("too large", reason="MEDIA_TOO_LARGE")
+        if not data:
+            raise errors.invalid_argument("the uploaded file is empty", reason="MEDIA_EMPTY")
         self.objects[key] = data
-        return sha256(data).hexdigest()
+        return sha256(data).hexdigest(), len(data)
 
     def open(self, key: str) -> AsyncIterator[bytes]:
         data = self.objects[key]
@@ -145,7 +157,7 @@ class Harness:
             owner_id=kwargs.pop("owner_id", "dev-1"),
             kind=MediaKind.IMAGE,
             declared_type="image/png",
-            data=PNG,
+            chunks=one(PNG),
             filename="shot.png",
             **kwargs,
         )
@@ -155,7 +167,7 @@ class Harness:
             owner_id=kwargs.pop("owner_id", "dev-1"),
             kind=MediaKind.GAME_BINARY,
             declared_type="application/zip",
-            data=ZIP,
+            chunks=one(ZIP),
             filename="game.zip",
             **kwargs,
         )
@@ -185,7 +197,7 @@ async def test_an_html_file_declared_as_a_png_is_refused_and_stores_nothing(h: H
             owner_id="dev-1",
             kind=MediaKind.IMAGE,
             declared_type="image/png",
-            data=HTML,
+            chunks=one(HTML),
             filename="evil.png",
         )
     assert caught.value.reason == "CONTENT_TYPE_MISMATCH"
@@ -411,3 +423,74 @@ async def test_deleting_twice_publishes_only_one_event(h: Harness):
     await h.service.delete(media_id=view.id, user_id="dev-1", is_staff=False)
     await h.service.delete(media_id=view.id, user_id="dev-1", is_staff=False)
     assert h.publisher.types().count(ev.MEDIA_DELETED) == 1
+
+
+# --- streaming -----------------------------------------------------------
+
+
+async def test_the_type_is_decided_from_the_first_chunk_alone(h: Harness):
+    """So a rejected upload costs one buffer rather than a whole file on disk."""
+
+    async def in_pieces():
+        yield PNG[:8]
+        yield PNG[8:]
+
+    view = await h.service.upload(
+        owner_id="dev-1",
+        kind=MediaKind.IMAGE,
+        declared_type="image/png",
+        chunks=in_pieces(),
+        filename="split.png",
+    )
+    assert view.content_type == "image/png"
+    assert view.size_bytes == len(PNG)
+
+
+async def test_a_bad_type_is_rejected_before_anything_is_written(h: Harness):
+    """The signature check happens before the first write, so the disk is never touched."""
+
+    async def in_pieces():
+        yield HTML[:8]
+        yield HTML[8:]
+
+    with pytest.raises(errors.AppError) as caught:
+        await h.service.upload(
+            owner_id="dev-1",
+            kind=MediaKind.IMAGE,
+            declared_type="image/png",
+            chunks=in_pieces(),
+        )
+    assert caught.value.reason == "CONTENT_TYPE_MISMATCH"
+    assert h.store.objects == {}
+
+
+async def test_an_empty_stream_is_refused_before_the_store_is_touched(h: Harness):
+    async def nothing():
+        return
+        yield b""  # pragma: no cover
+
+    with pytest.raises(errors.AppError) as caught:
+        await h.service.upload(
+            owner_id="dev-1",
+            kind=MediaKind.IMAGE,
+            declared_type="image/png",
+            chunks=nothing(),
+        )
+    assert caught.value.reason == "MEDIA_EMPTY"
+    assert h.store.objects == {}
+
+
+async def test_the_stores_size_limit_is_the_one_that_applies(h: Harness):
+    """The size is not knowable in advance from anything trustworthy, so the store enforces it
+    as the bytes pass through — and the use case passes the limit for the kind."""
+    from app.domain.media import MAX_SIZE
+
+    oversized = PNG[:8] + b"\x00" * MAX_SIZE[MediaKind.IMAGE]
+    with pytest.raises(errors.AppError) as caught:
+        await h.service.upload(
+            owner_id="dev-1",
+            kind=MediaKind.IMAGE,
+            declared_type="image/png",
+            chunks=one(oversized),
+        )
+    assert caught.value.reason == "MEDIA_TOO_LARGE"
