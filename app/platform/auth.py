@@ -102,9 +102,23 @@ class Verifier:
         except jwt.InvalidTokenError as exc:
             raise errors.unauthenticated("the token is not valid", reason="TOKEN_INVALID") from exc
 
-        if claims.get("typ") == "refresh":
+        # A whitelist, not a blacklist. This used to refuse only `typ == "refresh"`, so a token
+        # that said nothing about itself was assumed to be an access token — and the auth service
+        # spelled the claim `type`, which meant its seven-day refresh tokens, carrying a full
+        # role, were accepted on every endpoint here. Requiring the claim closes that for any
+        # future issuer too, not just the one that got it wrong.
+        # S105 is a false positive here: bandit sees a name ending in `_type` beside a literal and
+        # guesses "hardcoded password". This is a JWT claim value, and "access" is the contract.
+        # The two literals below carry `noqa: S105`, which is bandit guessing: it sees a name
+        # containing "token" compared against a string and reports a hardcoded password. These are
+        # JWT claim values, and they are the contract with the auth service.
+        token_type = str(claims.get("typ") or "")
+        if token_type != "access":  # noqa: S105
             raise errors.unauthenticated(
-                "a refresh token cannot be used to call the API", reason="REFRESH_TOKEN_USED"
+                "only an access token may be used to call the API",
+                reason=(
+                    "REFRESH_TOKEN_USED" if token_type == "refresh" else "WRONG_TOKEN_TYPE"  # noqa: S105
+                ),
             )
 
         subject = claims.get("sub") or ""
