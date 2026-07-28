@@ -118,24 +118,50 @@ boot-time sweep clears the partial writes.
 A catalogue entry or a community post may still reference the id. The bytes go; the record
 that they existed does not, so a dangling reference can still say what it pointed at.
 
-### The filesystem instead of MinIO
+### Two object stores, chosen by one variable
 
-The architecture document specifies MinIO. This runs on a directory, because MinIO is another
-container, another ~300 MB of memory and another credential — and the platform runs on plain
-Docker with a stated shortage of resources.
+`STORAGE_BACKEND` is `s3` (MinIO, as the architecture document specifies) or `filesystem` (a
+directory). The compose stack sets `s3`; the service defaults to `filesystem` so a bare `pytest`
+and a one-off container need nothing running alongside them.
 
-**The trade-off is real.** A filesystem store means this service is *not* stateless: two
-replicas do not see each other's files without a shared volume, and there is no replication.
-That is fine for a single-replica local and demo deployment and is not fine in production.
+Both exist on purpose, because they trade opposite things:
 
-It is also cheap to change. Everything above
-[`adapters/outbound/filesystem.py`](app/adapters/outbound/filesystem.py) talks to the
-`ObjectStore` protocol, so an S3 or MinIO adapter is a new file beside it and one line in
-`bootstrap.py`. Nothing in the domain or the use cases moves.
+| | filesystem | s3 |
+|---|---|---|
+| Extra containers | none | MinIO, ~512 MB |
+| Replicas | **one** — two do not see each other's files | any |
+| Store outgrows one disk | it cannot | it can |
+| Shares a disk with Postgres | yes, and filling it stops the database writing | no |
+| Presigned download offload | not possible | possible later |
 
-Within that choice, the adapter behaves properly: writes stream to a temporary file and are
-`fsync`ed before an atomic `os.replace`, and every blocking call runs in a worker thread so an
-upload does not stall the event loop.
+The second one is why S3 exists: a filesystem store makes this service **stateful**, and being
+stateless is the precondition for running more than one of it.
+
+**The port was drawn in the right place, and there is now evidence for that rather than a
+claim.** This README used to say an S3 adapter would be "a new file beside it and one line in
+`bootstrap.py`". It was:
+[`adapters/outbound/s3.py`](app/adapters/outbound/s3.py) plus one `if` choosing the backend.
+Nothing in the domain, the use cases or the REST edge changed. Two things did move into the port
+that had been assumed filesystem-shaped — `check_ready` and `start`/`aclose` — because "is this
+store usable" has a different answer per backend and only the backend knows it.
+
+Each adapter then behaves properly *for its own medium*. The filesystem streams to a temporary
+file, `fsync`s it and does an atomic `os.replace`, with every blocking call in a worker thread.
+S3 buffers one part, sends a single `PUT` if the file fits inside it — every screenshot does —
+and escalates to multipart only for something genuinely large, never holding more than one part
+in memory. Both compute their own sha256 as the bytes pass through, because S3's `ETag` is an MD5
+for one PUT and something else entirely for a multipart upload.
+
+**Switching an existing store needs a copy.** The metadata rows survive a backend change and
+their bytes do not, so every download 404s until the objects are moved:
+
+```bash
+make -C infra media-migrate     # volume -> bucket, safe to re-run
+```
+
+Going back the other way is the same `mc mirror` reversed. `make e2e` catches a store that was
+switched without one — `test_no_media_row_lacks_its_bytes` reads whichever backend is running
+and lists the rows whose objects are missing.
 
 ### Nothing ever holds a whole file
 
@@ -166,7 +192,8 @@ app/
 ├── adapters/
 │   ├── inbound/rest/       FastAPI routers
 │   └── outbound/
-│       ├── filesystem.py   ── the ObjectStore implementation ──
+│       ├── filesystem.py   ─┬─ the two ObjectStore implementations ─
+│       ├── s3.py           ─┘  (STORAGE_BACKEND picks one)
 │       ├── repositories.py PostgreSQL metadata
 │       └── publisher.py    the transactional outbox
 ├── platform/               general-purpose plumbing, vendored — see the catalog README
@@ -247,6 +274,20 @@ make test
 | `test_upload_rules.py` | The allowlist, the size limits, visibility, filename sanitising |
 | `test_download_tokens.py` | Adversarial: tampering, expiry extension, wrong-file tokens |
 | `test_filesystem_store.py` | The real adapter — atomicity, sharding, chunked streaming |
+| `test_s3_store.py` | The S3 adapter: multipart escalation against a fake, round trips against a real MinIO |
+
+`test_s3_store.py` is in two halves. The fake-client half asserts how many requests a small file
+costs — a real server answers correctly either way and says nothing about the round trips. The
+other half needs a live MinIO and skips without one:
+
+```bash
+ARCADIA_S3_ENDPOINT=http://localhost:9000 pytest tests/test_s3_store.py
+```
+
+That half is not optional thoroughness. This adapter shipped with a download that streamed
+**nothing** behind a declared `Content-Length` — `async with response["Body"] as body` binds the
+underlying aiohttp response, which has no `iter_chunks` — and every fake passed. The first real
+read caught it.
 | `test_media_service.py` | The use cases, and the bytes-before-metadata ordering |
 | `test_api.py` | A full HTTP round trip and the security response headers |
 

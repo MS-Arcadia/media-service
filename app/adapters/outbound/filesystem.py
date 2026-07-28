@@ -1,17 +1,16 @@
 """The object store, on the local filesystem.
 
-The architecture document specifies MinIO. This runs on a directory instead, for one reason:
-MinIO is another container, another 300 MB of memory and another credential to manage, and
-the platform is being run on plain Docker with a stated shortage of resources.
+The cheap backend: no extra container, no credentials, nothing to start. That is what makes a
+laptop and a CI run cheap, and it is why this is still here now that `s3.py` exists.
 
-The trade-off is real and worth stating. A filesystem store means the service is **not**
-stateless: two replicas do not see each other's files unless they share a volume, and there
-is no replication. That is acceptable for a single-replica local and demo deployment and is
-not acceptable in production.
+The trade-off is real and unchanged. A filesystem store means the service is **not** stateless:
+two replicas do not see each other's files unless they share a volume, the store cannot outgrow
+one disk, and on the compose stack that disk is shared with Postgres. Fine for one replica
+locally; not fine in production, which is what `s3.py` is for. `STORAGE_BACKEND` picks.
 
-It is also cheap to fix. Everything above this file talks to ``ObjectStore``, so an S3 or
-MinIO adapter is a new file next to this one and one line in ``bootstrap.py``. Nothing in the
-domain or the use cases changes.
+This file also predicted its own replacement — "an S3 or MinIO adapter is a new file next to
+this one and one line in bootstrap.py" — and that turned out to be true, which is the only
+useful evidence that the port was drawn in the right place.
 
 Writes stream to a temporary file and are then renamed. ``os.replace`` is atomic within a
 filesystem, so a crash mid-write leaves a temporary file to clean up rather than a
@@ -42,6 +41,18 @@ class FilesystemObjectStore:
         self._tmp = self._root / ".tmp"
         self._root.mkdir(parents=True, exist_ok=True)
         self._tmp.mkdir(parents=True, exist_ok=True)
+
+    # --- lifecycle -------------------------------------------------------
+
+    async def start(self) -> None:
+        """Nothing to open — the directories are made in the constructor.
+
+        Present so the bootstrap can call `start` unconditionally. An empty method that removes
+        a branch from the caller is worth more than the branch.
+        """
+
+    async def aclose(self) -> None:
+        """Nothing to release."""
 
     # --- paths -----------------------------------------------------------
 
@@ -178,6 +189,28 @@ class FilesystemObjectStore:
             return total
 
         return await asyncio.to_thread(walk)
+
+    async def check_ready(self) -> None:
+        """Write a byte and remove it again.
+
+        A read-only mount and a missing volume both look fine to a directory check and fail on
+        the first upload, which is exactly the failure readiness exists to catch first.
+
+        In a worker thread because these are blocking syscalls: on a stalled network mount they
+        block for as long as the mount takes, and doing that on the event loop would freeze every
+        other request in the process — turning a readiness check into an outage.
+        """
+
+        def probe() -> None:
+            if not self._root.is_dir():
+                raise errors.unavailable(
+                    f"{self._root} is not a directory", reason="STORAGE_ROOT_MISSING"
+                )
+            marker = self._root / ".readyz"
+            marker.write_text("ok", encoding="utf-8")
+            marker.unlink()
+
+        await asyncio.to_thread(probe)
 
     async def sweep_temporary_files(self) -> int:
         """Remove leftover partial writes.

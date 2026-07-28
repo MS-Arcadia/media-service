@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field, model_validator
 
@@ -13,9 +14,30 @@ class Config(BaseConfig):
     service_name: str = "media-service"
     http_port: int = 8084
 
-    # Where the bytes go. A directory rather than a MinIO bucket — see
-    # adapters/outbound/filesystem.py for the trade-off and how to change it.
+    # Which object store to use. "s3" for MinIO or AWS, "filesystem" for a directory.
+    #
+    # Defaults to the filesystem so a bare `pytest` and a one-off container need nothing running
+    # alongside them. The compose stack sets "s3", because that is the deployment where being
+    # stateless is worth another container.
+    storage_backend: Literal["filesystem", "s3"] = "filesystem"
+
+    # Where the bytes go with the filesystem backend. Ignored by "s3".
     storage_root: str = "/var/lib/arcadia/media"
+
+    # S3 / MinIO. Required when storage_backend is "s3"; see the validator below.
+    s3_endpoint_url: str = ""
+    s3_access_key: str = ""
+    s3_secret_key: str = ""
+    s3_bucket: str = "arcadia-media"
+    s3_region: str = "us-east-1"
+    # The buffer that decides single-PUT versus multipart, and therefore the peak memory of one
+    # concurrent upload. S3's own minimum for a non-final part is 5 MiB and the adapter refuses
+    # anything below it.
+    s3_part_size_bytes: int = 8 * 1024 * 1024
+    # Create the bucket at boot if it is missing. True locally, where nothing else will; a real
+    # deployment usually has it made in advance with a lifecycle policy attached, and should not
+    # hand a running service the permission to create buckets.
+    s3_create_bucket: bool = True
 
     # Signs download URLs. A separate secret from JWT_SECRET on purpose: a download token is
     # not an identity token, and one leaking must not compromise the other.
@@ -61,6 +83,43 @@ class Config(BaseConfig):
             raise ValueError("DOWNLOAD_SECRET must differ from JWT_SECRET")
         if self.is_production and "change-me" in self.download_secret.lower():
             raise ValueError("DOWNLOAD_SECRET still holds its development placeholder")
+        return self
+
+    @model_validator(mode="after")
+    def _check_storage(self) -> Config:
+        """Refuse to boot on an S3 configuration that cannot work.
+
+        At boot rather than on first use. A missing endpoint or key surfaces otherwise as a
+        failed upload — after a developer has transferred a build — and the error is a botocore
+        message about credentials rather than a sentence naming the variable nobody set.
+        """
+        if self.storage_backend != "s3":
+            return self
+
+        missing = [
+            name
+            for name, value in (
+                ("S3_ENDPOINT_URL", self.s3_endpoint_url),
+                ("S3_ACCESS_KEY", self.s3_access_key),
+                ("S3_SECRET_KEY", self.s3_secret_key),
+                ("S3_BUCKET", self.s3_bucket),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                f"STORAGE_BACKEND=s3 requires {', '.join(missing)}",
+            )
+        if not self.s3_endpoint_url.startswith(("http://", "https://")):
+            raise ValueError("S3_ENDPOINT_URL must include a scheme, e.g. http://minio:9000")
+        if self.is_production and self.s3_endpoint_url.startswith("http://"):
+            # Credentials are signed rather than sent, but the objects themselves are not, and a
+            # game build crossing a network in plaintext is worth refusing outright.
+            raise ValueError("S3_ENDPOINT_URL must be https outside development")
+        if self.is_production and self.s3_create_bucket:
+            # A service that can create buckets can create them by accident — a typo in
+            # S3_BUCKET silently starts a fresh, empty store rather than failing.
+            raise ValueError("S3_CREATE_BUCKET must be false outside development")
         return self
 
 

@@ -1,9 +1,13 @@
 """The interfaces the use cases depend on.
 
-``ObjectStore`` is the one that matters. The architecture document specifies MinIO; this
-runs on the local filesystem. Because the use cases only ever see this protocol, swapping in
-an S3 or MinIO adapter is a new file in ``adapters/outbound`` and one line in
-``bootstrap.py`` — nothing above this line changes.
+``ObjectStore`` is the one that matters, and it now has two implementations: a directory on the
+local filesystem, and S3 — MinIO locally. That the second one was a new file in
+``adapters/outbound`` plus one branch in ``bootstrap.py``, with nothing in the domain or the use
+cases touched, is the whole argument for the protocol being here.
+
+Keeping both is deliberate. The filesystem store needs no extra container, which is what makes a
+laptop or a CI run cheap; S3 makes the service stateless, which is what makes more than one
+replica possible. `STORAGE_BACKEND` picks one.
 """
 
 from __future__ import annotations
@@ -25,6 +29,21 @@ class IdFactory(Protocol):
 
 class ObjectStore(Protocol):
     """Where the bytes live."""
+
+    async def start(self) -> None:
+        """Open whatever the store needs, and fail loudly if it cannot.
+
+        Part of the port even though one backend has nothing to open, so the bootstrap has a
+        single unconditional call rather than a second `if` beside the one that chose the
+        backend. A store that connected lazily instead would turn a wrong endpoint or a missing
+        key into a failed upload — after a developer transferred a build — rather than a service
+        that refuses to start.
+        """
+        ...
+
+    async def aclose(self) -> None:
+        """Release it again. A no-op for a store that holds nothing."""
+        ...
 
     async def put(
         self, key: str, chunks: AsyncIterator[bytes], *, max_bytes: int
@@ -59,6 +78,26 @@ class ObjectStore(Protocol):
 
     async def usage_bytes(self) -> int:
         """Total stored size, for the readiness probe and the metrics."""
+        ...
+
+    async def sweep_temporary_files(self) -> int:
+        """Clear whatever a crash mid-upload left behind, and say how much.
+
+        Both backends leak something on a crash and neither leak is referenced by anything: a
+        `.part` file on the filesystem, an unfinished multipart upload on S3. The S3 one costs
+        storage until it is aborted and nothing lists it by accident, so this is not tidiness.
+        """
+        ...
+
+    async def check_ready(self) -> None:
+        """Prove the store is **writable**, raising if it is not.
+
+        Part of the port rather than a check in the bootstrap, because "is this store usable"
+        has a different answer for each backend and only the backend knows it. A directory that
+        exists and a bucket that responds to HEAD both look fine while being read-only, and that
+        difference surfaces on the first upload — which is the failure readiness exists to catch
+        before it reaches a user.
+        """
         ...
 
 

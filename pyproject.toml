@@ -20,6 +20,11 @@ dependencies = [
     "pyjwt>=2.9,<3.0",
     "prometheus-client>=0.21,<1.0",
     "python-multipart>=0.0.12,<1.0",
+    # S3/MinIO. aiobotocore rather than a hand-rolled SigV4 signer: request signing and
+    # multipart upload are both specified in enough detail that getting them subtly wrong is
+    # easy and silent, and neither is this service's problem to solve. The low-level client is
+    # used directly — boto3 and aioboto3 add a resource layer this needs nothing from.
+    "aiobotocore>=2.15,<3.0",
 ]
 
 [project.optional-dependencies]

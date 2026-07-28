@@ -6,7 +6,6 @@ is a different class on one line here.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -21,8 +20,10 @@ from app.adapters.inbound.rest import media as media_routes
 from app.adapters.outbound.filesystem import FilesystemObjectStore
 from app.adapters.outbound.publisher import OutboxPublisher
 from app.adapters.outbound.repositories import PostgresMediaRepository
+from app.adapters.outbound.s3 import S3ObjectStore
 from app.application.download_token import TokenIssuer
 from app.application.media_service import MediaService
+from app.application.ports import ObjectStore
 from app.config import Config, get_config
 from app.platform import health, kafka, migrate
 from app.platform import logging as logx
@@ -71,7 +72,22 @@ def build(config: Config | None = None) -> FastAPI:
     uow = UnitOfWork(sessions)
 
     repository = PostgresMediaRepository()
-    store = FilesystemObjectStore(cfg.storage_root)
+    # The one branch the second backend cost. Everything below this line — the use cases, the
+    # REST edge, the readiness probe, the metrics — is written against `ObjectStore` and does not
+    # know which of the two it got.
+    store: ObjectStore
+    if cfg.storage_backend == "s3":
+        store = S3ObjectStore(
+            endpoint_url=cfg.s3_endpoint_url,
+            access_key=cfg.s3_access_key,
+            secret_key=cfg.s3_secret_key,
+            bucket=cfg.s3_bucket,
+            region=cfg.s3_region,
+            part_size=cfg.s3_part_size_bytes,
+            create_bucket=cfg.s3_create_bucket,
+        )
+    else:
+        store = FilesystemObjectStore(cfg.storage_root)
     publisher = OutboxPublisher(
         producer_name=cfg.service_name, media_events_topic=cfg.topic_media_events
     )
@@ -110,26 +126,10 @@ def build(config: Config | None = None) -> FastAPI:
 
     probes.add("postgres", check_database, critical=True)
 
-    def _probe_storage() -> None:
-        """Write a byte and remove it again.
-
-        A read-only mount and a missing volume both look fine to a directory check and fail
-        on the first upload, which is exactly the failure readiness exists to catch first.
-        """
-        root = Path(cfg.storage_root)
-        if not root.is_dir():
-            raise RuntimeError(f"{cfg.storage_root} is not a directory")
-        probe = root / ".readyz"
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink()
-
-    async def check_storage() -> None:
-        # In a worker thread: these are blocking syscalls, and on a stalled network mount
-        # they block for as long as the mount takes. Doing that on the event loop would
-        # freeze every other request — turning a readiness check into an outage.
-        await asyncio.to_thread(_probe_storage)
-
-    probes.add("storage", check_storage, critical=True)
+    # Asked of the store rather than worked out here. "Is this store usable" has a different
+    # answer per backend — a writable directory, a writable bucket — and only the backend knows
+    # which question to ask. It was inlined for the filesystem before S3 existed.
+    probes.add("storage", store.check_ready, critical=True)
 
     if dispatcher is not None:
 
@@ -148,11 +148,17 @@ def build(config: Config | None = None) -> FastAPI:
             applied = await migrate.run(strip_asyncpg_dsn(cfg.database_url), MIGRATIONS)
             logger.info("migrations up to date", extra={"applied": applied})
 
-        # A crash between opening a temporary file and renaming it leaves a partial write that
-        # nothing references. Cleared at boot, which is the one moment it is certainly safe.
+        # Before anything can use it, and before readiness can be asked. On S3 this opens the
+        # client and makes sure the bucket is there; on the filesystem it does nothing.
+        await store.start()
+
+        # A crash mid-upload leaves something nothing references — a `.part` file on the
+        # filesystem, an unfinished multipart upload on S3. The second costs storage until it is
+        # aborted and nothing lists it by accident, so this is not tidiness. Boot is the one
+        # moment clearing it is certainly safe.
         swept = await store.sweep_temporary_files()
         if swept:
-            logger.info("removed leftover partial uploads", extra={"count": swept})
+            logger.info("cleared abandoned uploads", extra={"count": swept})
 
         if producer is not None:
             await producer.start()
@@ -182,7 +188,16 @@ def build(config: Config | None = None) -> FastAPI:
             "media-service started",
             extra={
                 "environment": cfg.environment,
-                "storage_root": cfg.storage_root,
+                # The backend, and only the location that backend actually uses. Logging
+                # `storage_root` unconditionally said `/var/lib/arcadia/media` while every byte
+                # was going to a bucket — a line that answers "where are my files" wrongly is
+                # worse than one that does not answer it.
+                "storage_backend": cfg.storage_backend,
+                "storage_location": (
+                    f"{cfg.s3_endpoint_url}/{cfg.s3_bucket}"
+                    if cfg.storage_backend == "s3"
+                    else cfg.storage_root
+                ),
                 "kafka": cfg.kafka_enabled,
                 "port": cfg.http_port,
             },
@@ -194,6 +209,9 @@ def build(config: Config | None = None) -> FastAPI:
                 await dispatcher.stop()
             if producer is not None:
                 await producer.stop()
+            # After the dispatcher and producer, before the engine: an in-flight download is
+            # reading through this client, and closing it first would abort the response.
+            await store.aclose()
             await engine.dispose()
             logger.info("media-service stopped")
 
