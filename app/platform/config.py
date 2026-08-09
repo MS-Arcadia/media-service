@@ -42,7 +42,6 @@ class BaseConfig(BaseSettings):
     # the runtime, and 127.0.0.1 would be unreachable from outside the container.
     http_host: str = "0.0.0.0"  # noqa: S104
     http_port: int = 8080
-    cors_origins: CsvList = Field(default_factory=list)
     request_timeout_seconds: float = 15.0
 
     # --- database --------------------------------------------------------
@@ -77,7 +76,7 @@ class BaseConfig(BaseSettings):
     jwt_issuer: str = "arcadia-auth"
     jwt_audience: str = "arcadia"
 
-    @field_validator("kafka_brokers", "cors_origins", mode="before")
+    @field_validator("kafka_brokers", mode="before")
     @classmethod
     def _split_csv(cls, value: object) -> object:
         """Accept a comma-separated string, which is what an env var actually is.

@@ -37,7 +37,6 @@ def env(monkeypatch: pytest.MonkeyPatch):
     for key in [
         *BASE_ENV,
         "KAFKA_BROKERS",
-        "CORS_ORIGINS",
         "KAFKA_ENABLED",
         "HTTP_PORT",
         "ENVIRONMENT",
@@ -85,15 +84,10 @@ def test_a_single_broker_is_not_split_into_characters(env):
     assert cfg.kafka_brokers == ["localhost:9092"]
 
 
-def test_cors_origins_takes_the_same_form(env):
-    cfg = load(env, CORS_ORIGINS="http://localhost:3000,https://arcadia.example")
-    assert cfg.cors_origins == ["http://localhost:3000", "https://arcadia.example"]
-
-
 def test_an_empty_list_variable_is_empty_not_a_blank_entry(env):
-    """`CORS_ORIGINS=` in a .env file is a real thing people write."""
-    cfg = load(env, CORS_ORIGINS="")
-    assert cfg.cors_origins == []
+    """`KAFKA_BROKERS=` in a .env file is a real thing people write."""
+    cfg = load(env, KAFKA_BROKERS="")
+    assert cfg.kafka_brokers == []
 
 
 def test_the_default_broker_applies_when_the_variable_is_absent(env):

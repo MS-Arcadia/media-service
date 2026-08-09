@@ -5,9 +5,9 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import model_validator
 
-from app.platform.config import BaseConfig, CsvList
+from app.platform.config import BaseConfig
 
 
 class Config(BaseConfig):
@@ -61,11 +61,6 @@ class Config(BaseConfig):
     owner_quota_bytes: int = 5 * 1024 * 1024 * 1024
 
     topic_media_events: str = "media-events"
-
-    # CsvList, not list[str]: redeclaring the field here would otherwise discard the
-    # NoDecode annotation it carries in BaseConfig, and CORS_ORIGINS=a,b would fail to
-    # parse at boot.
-    cors_origins: CsvList = Field(default_factory=lambda: ["http://localhost:3000"])
 
     @property
     def owned_topics(self) -> list[str]:

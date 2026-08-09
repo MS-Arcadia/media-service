@@ -12,7 +12,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import Gauge
 from sqlalchemy import text
 
@@ -237,16 +236,6 @@ def build(config: Config | None = None) -> FastAPI:
     )
     app.state.media_service = media_service
     app.state.object_store = store
-
-    if cfg.cors_origins:
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=cfg.cors_origins,
-            allow_credentials=True,
-            allow_methods=["GET", "POST", "DELETE"],
-            allow_headers=["Authorization", "Content-Type", "X-Correlation-ID"],
-            expose_headers=["ETag", "Content-Disposition"],
-        )
 
     install_middleware(app, service=cfg.service_name)
     install_error_handlers(app)
