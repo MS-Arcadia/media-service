@@ -133,32 +133,40 @@ def install_middleware(app: FastAPI, *, service: str) -> None:
         correlation = request.headers.get(CORRELATION_HEADER) or new_id()
         token = correlation_id_var.set(correlation)
         started = time.perf_counter()
+        # Everything that logs stays inside this try, and the reset is the only
+        # thing in `finally`. That ordering is load-bearing: the access log below
+        # reads the correlation id off this ContextVar, so resetting before it ran
+        # left every access line — the one line per request a trace actually starts
+        # from — with no id. Handler logs emitted during call_next carried it
+        # correctly, which is what made the gap easy to miss.
         try:
             response = await call_next(request)
-        finally:
             elapsed = time.perf_counter() - started
+
+            # The route template, never the concrete path: labelling by path would
+            # mint a new time series per order id and eventually take Prometheus down.
+            route = request.scope.get("route")
+            route_label = getattr(route, "path", request.url.path)
+
+            requests_total.labels(
+                service, request.method, route_label, str(response.status_code)
+            ).inc()
+            request_duration.labels(service, request.method, route_label).observe(elapsed)
+
+            response.headers[CORRELATION_HEADER] = correlation
+            if request.url.path not in ("/livez", "/readyz", "/metrics"):
+                logger.info(
+                    "request",
+                    extra={
+                        "method": request.method,
+                        "path": request.url.path,
+                        "status": response.status_code,
+                        "duration_ms": round(elapsed * 1000, 2),
+                    },
+                )
+            return response
+        finally:
             correlation_id_var.reset(token)
-
-        # The route template, never the concrete path: labelling by path would mint a
-        # new time series per order id and eventually take Prometheus down.
-        route = request.scope.get("route")
-        route_label = getattr(route, "path", request.url.path)
-
-        requests_total.labels(service, request.method, route_label, str(response.status_code)).inc()
-        request_duration.labels(service, request.method, route_label).observe(elapsed)
-
-        response.headers[CORRELATION_HEADER] = correlation
-        if request.url.path not in ("/livez", "/readyz", "/metrics"):
-            logger.info(
-                "request",
-                extra={
-                    "method": request.method,
-                    "path": request.url.path,
-                    "status": response.status_code,
-                    "duration_ms": round(elapsed * 1000, 2),
-                },
-            )
-        return response
 
 
 def install_operational_routes(app: FastAPI, *, readiness: Callable[[], Awaitable[dict]]) -> None:
