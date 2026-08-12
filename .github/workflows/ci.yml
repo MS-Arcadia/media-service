@@ -136,3 +136,25 @@ jobs:
             [ -n "$tag" ] || continue
             docker push "$tag"
           done
+
+  deploy:
+    name: Deploy to arcadia
+    runs-on: ubuntu-latest
+    needs: [image]
+    # Only a real push to main gets rolled out — not a PR build, not a tag build.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Configure kubectl credentials
+        run: |
+          mkdir -p ~/.kube
+          printf '%s' "${{ secrets.ARCADIA_KUBECONFIG }}" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      # `set image` wouldn't trigger a rollout here: the tag is always :latest, so
+      # the pod template's image string never changes. `rollout restart` forces new
+      # pods regardless, and imagePullPolicy: Always (the default for :latest) means
+      # they pull the image this workflow just pushed.
+      - name: Roll out media-service
+        run: |
+          kubectl -n arcadia rollout restart deployment/media-service
+          kubectl -n arcadia rollout status deployment/media-service --timeout=180s
