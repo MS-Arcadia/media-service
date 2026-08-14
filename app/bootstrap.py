@@ -101,6 +101,8 @@ def build(config: Config | None = None) -> FastAPI:
         clock=SystemClock(),
         new_id=new_id,
         public_base_url=cfg.public_base_url,
+        s3_public_base_url=cfg.s3_public_base_url,
+        s3_bucket=cfg.s3_bucket,
         storage_soft_limit_bytes=cfg.storage_soft_limit_bytes,
         owner_quota_bytes=cfg.owner_quota_bytes,
     )

@@ -286,6 +286,15 @@ async def test_a_public_upload_gets_a_direct_url(h: Harness):
     assert view.url.endswith(f"/v1/media/{view.id}/content")
 
 
+async def test_a_public_upload_uses_the_minio_host_when_configured():
+    """Storefront covers should be a MinIO URL, not a media-service download."""
+    h = Harness()
+    h.service._s3_public_base_url = "https://minio.example"
+    h.service._s3_bucket = "arcadia-media"
+    view = await h.upload_png()
+    assert view.url == f"https://minio.example/arcadia-media/{view.id[:2]}/{view.id[2:4]}/{view.id}"
+
+
 async def test_a_private_upload_gets_no_direct_url(h: Harness):
     """Offering a URL that will 404 invites a client to use it."""
     view = await h.upload_build()

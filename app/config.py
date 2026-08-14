@@ -48,6 +48,11 @@ class Config(BaseConfig):
     # the internal Docker network.
     public_base_url: str = "http://localhost:8084"
 
+    # Public objects can be fetched straight from MinIO when this is set
+    # (`https://minio.arcadia.aptcodegen.online`). Empty keeps the media-service
+    # `/v1/media/{id}/content` URL, which is what local filesystem tests expect.
+    s3_public_base_url: str = ""
+
     # Refuse to accept uploads once the store is this full, so the disk is never filled to
     # the point where Postgres on the same host cannot write either.
     storage_soft_limit_bytes: int = 20 * 1024 * 1024 * 1024

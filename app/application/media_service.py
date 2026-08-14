@@ -53,6 +53,8 @@ class MediaService:
         public_base_url: str,
         storage_soft_limit_bytes: int,
         owner_quota_bytes: int,
+        s3_public_base_url: str = "",
+        s3_bucket: str = "",
     ) -> None:
         self._uow = uow
         self._repo = repository
@@ -62,6 +64,8 @@ class MediaService:
         self._clock = clock
         self._new_id = new_id
         self._public_base_url = public_base_url.rstrip("/")
+        self._s3_public_base_url = s3_public_base_url.rstrip("/")
+        self._s3_bucket = s3_bucket
         self._storage_soft_limit = storage_soft_limit_bytes
         self._owner_quota = owner_quota_bytes
 
@@ -380,14 +384,20 @@ class MediaService:
             reference_id=media.reference_id,
             uploaded_at=media.uploaded_at,
             deleted=media.is_deleted,
-            # A direct URL only for public objects. Putting one on a private object would
-            # invite a client to use it and get a 404 it cannot explain.
-            url=(
-                f"{self._public_base_url}/v1/media/{media.id}/content"
-                if media.is_public and not media.is_deleted
-                else ""
-            ),
+            url=self._public_url(media),
         )
+
+    def _public_url(self, media: MediaObject) -> str:
+        """A URL a browser can put in `<img src>` without another round trip.
+
+        Public objects on MinIO are world-readable at `{S3_PUBLIC_BASE_URL}/{bucket}/{key}`.
+        Without that host, the download still goes through this service.
+        """
+        if not media.is_public or media.is_deleted:
+            return ""
+        if self._s3_public_base_url and self._s3_bucket:
+            return f"{self._s3_public_base_url}/{self._s3_bucket}/{media.object_key}"
+        return f"{self._public_base_url}/v1/media/{media.id}/content"
 
 
 def _payload(media: MediaObject) -> dict:
