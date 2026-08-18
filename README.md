@@ -42,6 +42,66 @@ depend on.
 
 ---
 
+## Use cases
+
+| # | Use case | Actor | Notes |
+|---|---|---|---|
+| 1 | Upload an image | Developer / user | Type verified against the file's leading bytes, not its extension |
+| 2 | Upload a game build | Developer | Private by definition — a public URL for one is a pirated copy |
+| 3 | Read metadata for one object | Owner / staff | An object the caller may not read is reported as *not found*, never *forbidden* |
+| 4 | List objects for a reference | Anyone | Public objects only — it must not leak the build sitting behind the screenshots |
+| 5 | Download public content | Anyone | Direct object-store URL, cacheable and immutable |
+| 6 | Issue a download ticket | Owner / staff | A short-lived signed URL for private content |
+| 7 | Download private content | Ticket holder | `attachment` + `nosniff`, never cacheable |
+| 8 | Delete an object | Owner / staff | Soft — the row stays so a dangling reference resolves to "gone", not to a 500 |
+| 9 | Report storage usage | Owner / staff | Against the per-owner quota |
+
+## How it talks to the rest of the platform
+
+```mermaid
+graph LR
+    gw["api-gateway"] -->|"REST /media/*"| m["media-service"]
+    comm["community-service"] -->|"REST: upload attachment"| m
+    m --> s3[("MinIO / S3")]
+    browser["Browser"] -->|"direct GET<br/>public covers"| s3
+    m -->|"media-events:<br/>MediaUploaded, MediaDeleted"| me(("media-events"))
+    me --> comm
+
+    classDef s fill:#2d7dd2,stroke:#1a5a9e,color:#fff
+    classDef t fill:#f5a623,stroke:#c4841c,color:#000
+    classDef e fill:#4d4d4d,stroke:#333,color:#fff
+    class gw,m,comm s
+    class me t
+    class s3,browser e
+```
+
+| Direction | Peer | Why |
+|---|---|---|
+| Called by | community-service | Post attachments are uploaded on the caller's behalf; Community stores only a `media_ref` |
+| Called by | the storefront, indirectly | Nothing in the frontend uploads directly — game art arrives already-signed inside a game's `media[]` |
+| Publishes | `media-events` | Community learns when an attachment is ready or gone |
+| Storage | MinIO (S3-compatible) | Objects; PostgreSQL holds only metadata |
+
+Catalog stores a `media_ref` string and never the bytes. That is what keeps a game's record
+small and this service the only thing that has to know about object stores.
+
+**`PUBLIC_BASE_URL` and `S3_PUBLIC_BASE_URL` must be browser-reachable hostnames.** This
+service signs absolute URLs and hands them to the catalogue, which hands them to an `<img>`.
+A cluster-internal name resolves nowhere outside the cluster, so every cover renders broken
+while the API returns a URL that looks perfectly correct.
+
+## Infrastructure
+
+| Concern | Choice |
+|---|---|
+| Language | Python 3.13, FastAPI |
+| Metadata | PostgreSQL — `arcadia_media` |
+| Objects | MinIO, S3-compatible; a filesystem backend exists for local work |
+| Messaging | Kafka, transactional outbox |
+| Streaming | Nothing ever holds a whole file in memory |
+| Port | 8084 |
+| Deployment | 1 replica, HPA to 4 at 70% CPU |
+
 ## The decisions worth explaining
 
 ### The declared content type is worthless on its own
